@@ -1750,7 +1750,6 @@ It has two cases:
    partial type signature), so we infer the type and generalise.
 -}
 
-
 ------------------------------
 -- | Kind-check a 'LHsQTyVars'. If the decl under consideration has a complete,
 -- user-supplied kind signature (CUSK), generalise the result.

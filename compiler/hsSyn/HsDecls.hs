@@ -24,7 +24,7 @@ module HsDecls (
   -- ** Class or type declarations
   TyClDecl(..), LTyClDecl, DataDeclRn(..),
   TyClGroup(..), mkTyClGroup, emptyTyClGroup,
-  tyClGroupTyClDecls, tyClGroupInstDecls, tyClGroupRoleDecls,
+  tyClGroupTyClDecls, tyClGroupInstDecls, tyClGroupRoleDecls, tyClGroupTLKSs,
   isClassDecl, isDataDecl, isSynDecl, tcdName,
   isFamilyDecl, isTypeFamilyDecl, isDataFamilyDecl,
   isOpenTypeFamilyInfo, isClosedTypeFamilyInfo,
@@ -111,6 +111,7 @@ import Type
 import Bag
 import Maybes
 import Data.Data        hiding (TyCon,Fixity, Infix)
+import Data.Void
 
 {-
 ************************************************************************
@@ -739,10 +740,13 @@ instance (p ~ GhcPass pass, OutputableBndrId p)
        => Outputable (TyClGroup p) where
   ppr (TyClGroup { group_tyclds = tyclds
                  , group_roles = roles
+                 , group_tlkss = tlkss
                  , group_instds = instds
                  }
       )
-    = ppr tyclds $$
+    = hang (text "TyClGroup") 2 $
+      ppr tlkss $$
+      ppr tyclds $$
       ppr roles $$
       ppr instds
   ppr (XTyClGroup x) = ppr x
@@ -903,6 +907,7 @@ data TyClGroup pass  -- See Note [TyClGroups and dependency analysis]
   = TyClGroup { group_ext    :: XCTyClGroup pass
               , group_tyclds :: [LTyClDecl pass]
               , group_roles  :: [LRoleAnnotDecl pass]
+              , group_tlkss  :: [LTopKindSig pass]
               , group_instds :: [LInstDecl pass] }
   | XTyClGroup (XXTyClGroup pass)
 
@@ -911,7 +916,7 @@ type instance XXTyClGroup (GhcPass _) = NoExt
 
 
 emptyTyClGroup :: TyClGroup (GhcPass p)
-emptyTyClGroup = TyClGroup noExt [] [] []
+emptyTyClGroup = TyClGroup noExt [] [] [] []
 
 tyClGroupTyClDecls :: [TyClGroup pass] -> [LTyClDecl pass]
 tyClGroupTyClDecls = concatMap group_tyclds
@@ -922,11 +927,15 @@ tyClGroupInstDecls = concatMap group_instds
 tyClGroupRoleDecls :: [TyClGroup pass] -> [LRoleAnnotDecl pass]
 tyClGroupRoleDecls = concatMap group_roles
 
+tyClGroupTLKSs :: [TyClGroup pass] -> [LTopKindSig pass]
+tyClGroupTLKSs = concatMap group_tlkss
+
 mkTyClGroup :: [LTyClDecl (GhcPass p)] -> [LInstDecl (GhcPass p)]
             -> TyClGroup (GhcPass p)
 mkTyClGroup decls instds = TyClGroup
   { group_ext = noExt
   , group_tyclds = decls
+  , group_tlkss = []
   , group_roles = []
   , group_instds = instds
   }
@@ -1030,7 +1039,7 @@ data FamilyResultSig pass = -- see Note [FamilyResultSig]
 type instance XNoSig            (GhcPass _) = NoExt
 type instance XCKindSig         (GhcPass _) = NoExt
 type instance XTyVarSig         (GhcPass _) = NoExt
-type instance XXFamilyResultSig (GhcPass _) = NoExt
+type instance XXFamilyResultSig (GhcPass _) = Void
 
 
 -- | Located type Family Declaration
@@ -1142,7 +1151,7 @@ pprFamilyDecl top_level (FamilyDecl { fdInfo = info, fdLName = ltycon
                 NoSig    _         -> empty
                 KindSig  _ kind    -> dcolon <+> ppr kind
                 TyVarSig _ tv_bndr -> text "=" <+> ppr tv_bndr
-                XFamilyResultSig x -> ppr x
+                XFamilyResultSig x -> absurd x
     pp_inj = case mb_inj of
                Just (L _ (InjectivityAnn lhs rhs)) ->
                  hsep [ vbar, ppr lhs, text "->", hsep (map ppr rhs) ]

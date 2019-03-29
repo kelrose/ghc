@@ -69,7 +69,7 @@ import Control.Arrow ( first )
 import Data.List ( mapAccumL )
 import qualified Data.List.NonEmpty as NE
 import Data.List.NonEmpty ( NonEmpty(..) )
-import Data.Maybe ( isNothing, fromMaybe )
+import Data.Maybe ( isNothing, fromMaybe, mapMaybe )
 import qualified Data.Set as Set ( difference, fromList, toList, null )
 
 {- | @rnSourceDecl@ "renames" declarations.
@@ -119,7 +119,6 @@ rnSrcDecls group@(HsGroup { hs_valds   = val_decls,
    --
    (tc_envs, tc_bndrs) <- getLocalNonValBinders local_fix_env group ;
 
-
    setEnvs tc_envs $ do {
 
    failIfErrsM ; -- No point in continuing if (say) we have duplicate declarations
@@ -155,7 +154,7 @@ rnSrcDecls group@(HsGroup { hs_valds   = val_decls,
    -- means we'll only report a declaration as unused if it isn't
    -- mentioned at all.  Ah well.
    traceRn "Start rnTyClDecls" (ppr tycl_decls) ;
-   (rn_tycl_decls, src_fvs1) <- rnTyClDecls tycl_decls ;
+   (rn_tycl_decls, src_fvs1) <- rnTyClDecls tc_bndrs tycl_decls ;
 
    -- (F) Rename Value declarations right-hand sides
    traceRn "Start rnmono" empty ;
@@ -632,7 +631,7 @@ rnClsInstDecl (ClsInstDecl { cid_poly_ty = inst_ty, cid_binds = mbinds
           -- the bindings are for the right class
           -- (Slightly strangely) when scoped type variables are on, the
           -- forall-d tyvars scope over the method bindings too
-       ; (mbinds', uprags', meth_fvs) <- rnMethodBinds False cls ktv_names mbinds uprags
+       ; (mbinds', uprags', meth_fvs) <- rnMethodBinds False cls [] ktv_names mbinds uprags
 
        ; checkCanonicalInstances cls inst_ty' mbinds'
 
@@ -1287,23 +1286,26 @@ constructors] in TcEnv
 -}
 
 
-rnTyClDecls :: [TyClGroup GhcPs]
+rnTyClDecls :: NameSet
+            -> [TyClGroup GhcPs]
             -> RnM ([TyClGroup GhcRn], FreeVars)
 -- Rename the declarations and do dependency analysis on them
-rnTyClDecls tycl_ds
+rnTyClDecls tc_bndrs tycl_ds
   = do { -- Rename the type/class, instance, and role declaraations
-         tycls_w_fvs <- mapM (wrapLocFstM rnTyClDecl)
+         tlkss_w_fvs <- rnTLKSs tc_bndrs (tyClGroupTLKSs tycl_ds)
+       ; let scopedTvFn = mkScopedTvFnTLKS (map (unLoc . fst) tlkss_w_fvs)
+       ; tycls_w_fvs <- mapM (wrapLocFstM (rnTyClDecl scopedTvFn))
                              (tyClGroupTyClDecls tycl_ds)
-       ; let tc_names = mkNameSet (map (tcdName . unLoc . fst) tycls_w_fvs)
-
        ; instds_w_fvs <- mapM (wrapLocFstM rnSrcInstDecl) (tyClGroupInstDecls tycl_ds)
-       ; role_annots  <- rnRoleAnnots tc_names (tyClGroupRoleDecls tycl_ds)
+       ; role_annots  <- rnRoleAnnots tc_bndrs (tyClGroupRoleDecls tycl_ds)
 
        -- Do SCC analysis on the type/class decls
        ; rdr_env <- getGlobalRdrEnv
-       ; let tycl_sccs = depAnalTyClDecls rdr_env tycls_w_fvs
+       ; let tycl_sccs = depAnalTyClDecls rdr_env tlks_env tycls_w_fvs
              role_annot_env = mkRoleAnnotEnv role_annots
+             tlks_env = mkTLKS_fv_env tlkss_w_fvs
 
+             tc_names = mkNameSet (map (tcdName . unLoc . fst) tycls_w_fvs)
              inst_ds_map = mkInstDeclFreeVarsMap rdr_env tc_names instds_w_fvs
              (init_inst_ds, rest_inst_ds) = getInsts [] inst_ds_map
 
@@ -1311,52 +1313,91 @@ rnTyClDecls tycl_ds
                | null init_inst_ds = []
                | otherwise = [TyClGroup { group_ext    = noExt
                                         , group_tyclds = []
+                                        , group_tlkss  = []
                                         , group_roles  = []
                                         , group_instds = init_inst_ds }]
 
-             ((final_inst_ds, orphan_roles), groups)
-                = mapAccumL mk_group (rest_inst_ds, role_annot_env) tycl_sccs
+             ((final_inst_ds, orphan_roles, orphan_tlkss), groups)
+                = mapAccumL mk_group (rest_inst_ds, role_annot_env, tlks_env) tycl_sccs
 
-
-             all_fvs = plusFV (foldr (plusFV . snd) emptyFVs tycls_w_fvs)
-                              (foldr (plusFV . snd) emptyFVs instds_w_fvs)
+             all_fvs = foldr (plusFV . snd) emptyFVs tycls_w_fvs  `plusFV`
+                       foldr (plusFV . snd) emptyFVs instds_w_fvs `plusFV`
+                       foldr (plusFV . snd) emptyFVs tlkss_w_fvs
 
              all_groups = first_group ++ groups
 
        ; ASSERT2( null final_inst_ds,  ppr instds_w_fvs $$ ppr inst_ds_map
                                        $$ ppr (flattenSCCs tycl_sccs) $$ ppr final_inst_ds  )
          mapM_ orphanRoleAnnotErr (nameEnvElts orphan_roles)
+       ; mapM_ orphanTLKS_Err (map fst $ nameEnvElts orphan_tlkss)
 
        ; traceRn "rnTycl dependency analysis made groups" (ppr all_groups)
        ; return (all_groups, all_fvs) }
   where
-    mk_group :: (InstDeclFreeVarsMap, RoleAnnotEnv)
+    mk_group :: (InstDeclFreeVarsMap, RoleAnnotEnv, TLKS_FV_Env)
              -> SCC (LTyClDecl GhcRn)
-             -> ( (InstDeclFreeVarsMap, RoleAnnotEnv)
+             -> ( (InstDeclFreeVarsMap, RoleAnnotEnv, TLKS_FV_Env)
                 , TyClGroup GhcRn )
-    mk_group (inst_map, role_env) scc
-      = ((inst_map', role_env'), group)
+    mk_group (inst_map, role_env, tlks_env) scc
+      = ((inst_map', role_env', tlks_env'), group)
       where
         tycl_ds              = flattenSCC scc
         bndrs                = map (tcdName . unLoc) tycl_ds
         (inst_ds, inst_map') = getInsts      bndrs inst_map
         (roles,   role_env') = getRoleAnnots bndrs role_env
+        (tlkss,   tlks_env') = getTLKSs      bndrs tlks_env
         group = TyClGroup { group_ext    = noExt
                           , group_tyclds = tycl_ds
+                          , group_tlkss  = tlkss
                           , group_roles  = roles
                           , group_instds = inst_ds }
 
 
+type TLKS_FV_Env = NameEnv (LTopKindSig GhcRn, FreeVars)
+
+mkTLKS_fv_env :: [(LTopKindSig GhcRn, FreeVars)] -> TLKS_FV_Env
+mkTLKS_fv_env tlkss_w_fvs =
+  mkNameEnv [ (tlksName tlks, tlks_w_fvs)
+            | tlks_w_fvs@(unLoc -> tlks, _fvs) <- tlkss_w_fvs ]
+
+getTLKSs :: [Name] -> TLKS_FV_Env -> ([LTopKindSig GhcRn], TLKS_FV_Env)
+getTLKSs bndrs tlks_env
+  = ( mapMaybe (fmap fst . lookupNameEnv tlks_env) bndrs
+    , delListFromNameEnv tlks_env bndrs )
+
+rnTLKSs :: NameSet
+        -> [LTopKindSig GhcPs]
+        -> RnM [(LTopKindSig GhcRn, FreeVars)]
+rnTLKSs tc_names tlkss
+  = do { let (no_dups, dup_tlkss) = removeDups tlks_cmp tlkss
+             tlks_cmp a b = tlksName (unLoc a) `compare` tlksName (unLoc b)
+       ; mapM_ dupTLKS_Err dup_tlkss
+       ; mapM (wrapLocFstM (renameTLKS tc_names)) no_dups
+       }
+
+-- | A version of 'mkScopedTvFn' for top-level kind signatures.
+mkScopedTvFnTLKS :: [TopKindSig GhcRn] -> (Name -> [Name])
+mkScopedTvFnTLKS sigs = fromMaybe [] . lookupNameEnv env
+  where env = mkNameEnv [ (unLoc name, hsWcScopedTvs sig_ty)
+                        | TopKindSig _ name sig_ty <- sigs ]
+
 depAnalTyClDecls :: GlobalRdrEnv
+                 -> TLKS_FV_Env
                  -> [(LTyClDecl GhcRn, FreeVars)]
                  -> [SCC (LTyClDecl GhcRn)]
 -- See Note [Dependency analysis of type, class, and instance decls]
-depAnalTyClDecls rdr_env ds_w_fvs
+depAnalTyClDecls rdr_env tlks_env ds_w_fvs
   = stronglyConnCompFromEdgedVerticesUniq edges
   where
     edges :: [ Node Name (LTyClDecl GhcRn) ]
-    edges = [ DigraphNode d (tcdName (unLoc d)) (map (getParent rdr_env) (nonDetEltsUniqSet fvs))
-            | (d, fvs) <- ds_w_fvs ]
+    edges = [ DigraphNode d name (map (getParent rdr_env) (nonDetEltsUniqSet deps))
+            | (d, fvs) <- ds_w_fvs,
+              let { name = tcdName (unLoc d)
+                  ; deps = fvs `plusFV`
+                           -- depend on free variables from the top-level kind signature
+                           maybe emptyFVs snd (lookupNameEnv tlks_env name)
+                  }
+            ]
             -- It's OK to use nonDetEltsUFM here as
             -- stronglyConnCompFromEdgedVertices is still deterministic
             -- even if the edges are in nondeterministic order as explained
@@ -1435,6 +1476,29 @@ orphanRoleAnnotErr (dL->L loc decl)
             quotes (ppr $ roleAnnotDeclName decl) <+>
             text "is declared.")
 
+orphanTLKS_Err :: LTopKindSig GhcRn -> RnM ()
+orphanTLKS_Err (dL->L loc decl)
+  = addErrAt loc $
+    hang (text "Top-level kind signature for a type previously declared:")
+       2 (ppr decl) $$
+    parens (text "The kind signature must be given where" <+>
+            quotes (ppr $ tlksName decl) <+>
+            text "is declared.")
+
+dupTLKS_Err :: NonEmpty (LTopKindSig GhcPs) -> RnM ()
+dupTLKS_Err list
+  = addErrAt loc $
+    hang (text "Duplicate top-level kind signatures for" <+>
+          quotes (ppr $ tlksName first_decl) <> colon)
+       2 (vcat $ map pp_tlks $ NE.toList sorted_list)
+    where
+      sorted_list = NE.sortBy cmp_loc list
+      ((dL->L loc first_decl) :| _) = sorted_list
+
+      pp_tlks (dL->L loc decl) =
+        hang (ppr decl) 4 (text "-- written at" <+> ppr loc)
+
+      cmp_loc (dL->L loc1 _) (dL->L loc2 _) = loc1 `compare` loc2
 
 {- Note [Role annotations in the renamer]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1519,23 +1583,26 @@ getInsts bndrs inst_decl_map
 *                                                       *
 ****************************************************** -}
 
-rnTyClDecl :: TyClDecl GhcPs
+rnTyClDecl :: (Name -> [Name])    -- Signature tyvar function
+           -> TyClDecl GhcPs
            -> RnM (TyClDecl GhcRn, FreeVars)
 
 -- All flavours of type family declarations ("type family", "newtype family",
 -- and "data family"), both top level and (for an associated type)
 -- in a class decl
-rnTyClDecl (FamDecl { tcdFam = decl })
+rnTyClDecl _sig_fn (FamDecl { tcdFam = decl })
   = do { (decl', fvs) <- rnFamDecl Nothing decl
        ; return (FamDecl noExt decl', fvs) }
 
-rnTyClDecl (SynDecl { tcdLName = tycon, tcdTyVars = tyvars,
+rnTyClDecl sig_fn
+           (SynDecl { tcdLName = tycon, tcdTyVars = tyvars,
                       tcdFixity = fixity, tcdRhs = rhs })
   = do { tycon' <- lookupLocatedTopBndrRn tycon
        ; let kvs = extractHsTyRdrTyVarsKindVars rhs
              doc = TySynCtx tycon
        ; traceRn "rntycl-ty" (ppr tycon <+> ppr kvs)
-       ; bindHsQTyVars doc Nothing Nothing kvs tyvars $ \ tyvars' _ ->
+       ; bindSigTyVarsFV (sig_fn (unLoc tycon')) $
+         bindHsQTyVars doc Nothing Nothing kvs tyvars $ \ tyvars' _ ->
     do { (rhs', fvs) <- rnTySyn doc rhs
        ; return (SynDecl { tcdLName = tycon', tcdTyVars = tyvars'
                          , tcdFixity = fixity
@@ -1543,13 +1610,15 @@ rnTyClDecl (SynDecl { tcdLName = tycon, tcdTyVars = tyvars,
 
 -- "data", "newtype" declarations
 -- both top level and (for an associated type) in an instance decl
-rnTyClDecl (DataDecl { tcdLName = tycon, tcdTyVars = tyvars,
+rnTyClDecl sig_fn
+           (DataDecl { tcdLName = tycon, tcdTyVars = tyvars,
                        tcdFixity = fixity, tcdDataDefn = defn })
   = do { tycon' <- lookupLocatedTopBndrRn tycon
        ; let kvs = extractDataDefnKindVars defn
              doc = TyDataCtx tycon
        ; traceRn "rntycl-data" (ppr tycon <+> ppr kvs)
-       ; bindHsQTyVars doc Nothing Nothing kvs tyvars $ \ tyvars' no_rhs_kvs ->
+       ; bindSigTyVarsFV (sig_fn (unLoc tycon')) $
+         bindHsQTyVars doc Nothing Nothing kvs tyvars $ \ tyvars' no_rhs_kvs ->
     do { (defn', fvs) <- rnDataDefn doc defn
           -- See Note [Complete user-supplied kind signatures] in HsDecls
        ; cusks_enabled <- xoptM LangExt.CUSKs
@@ -1563,7 +1632,8 @@ rnTyClDecl (DataDecl { tcdLName = tycon, tcdTyVars = tyvars,
                           , tcdDataDefn = defn'
                           , tcdDExt     = rn_info }, fvs) } }
 
-rnTyClDecl (ClassDecl { tcdCtxt = context, tcdLName = lcls,
+rnTyClDecl sig_fn
+           (ClassDecl { tcdCtxt = context, tcdLName = lcls,
                         tcdTyVars = tyvars, tcdFixity = fixity,
                         tcdFDs = fds, tcdSigs = sigs,
                         tcdMeths = mbinds, tcdATs = ats, tcdATDefs = at_defs,
@@ -1572,10 +1642,12 @@ rnTyClDecl (ClassDecl { tcdCtxt = context, tcdLName = lcls,
         ; let cls' = unLoc lcls'
               kvs = []  -- No scoped kind vars except those in
                         -- kind signatures on the tyvars
+              scoped_tvs = sig_fn cls'
 
         -- Tyvars scope over superclass context and method signatures
         ; ((tyvars', context', fds', ats'), stuff_fvs)
-            <- bindHsQTyVars cls_doc Nothing Nothing kvs tyvars $ \ tyvars' _ -> do
+            <- bindSigTyVarsFV scoped_tvs $
+               bindHsQTyVars cls_doc Nothing Nothing kvs tyvars $ \ tyvars' _ -> do
                   -- Checks for distinct tyvars
              { (context', cxt_fvs) <- rnContext cls_doc context
              ; fds'  <- rnFds fds
@@ -1610,7 +1682,7 @@ rnTyClDecl (ClassDecl { tcdCtxt = context, tcdLName = lcls,
         -- we want to name both "x" tyvars with the same unique, so that they are
         -- easy to group together in the typechecker.
         ; (mbinds', sigs', meth_fvs)
-            <- rnMethodBinds True cls' (hsAllLTyVarNames tyvars') mbinds sigs
+            <- rnMethodBinds True cls' scoped_tvs (hsAllLTyVarNames tyvars') mbinds sigs
                 -- No need to check for duplicate method signatures
                 -- since that is done by RnNames.extendGlobalRdrEnvRn
                 -- and the methods are already in scope
@@ -1628,7 +1700,7 @@ rnTyClDecl (ClassDecl { tcdCtxt = context, tcdLName = lcls,
   where
     cls_doc  = ClassDeclCtx lcls
 
-rnTyClDecl (XTyClDecl _) = panic "rnTyClDecl"
+rnTyClDecl _ (XTyClDecl _) = panic "rnTyClDecl"
 
 -- "type" and "type instance" declarations
 rnTySyn :: HsDocContext -> LHsType GhcPs -> RnM (LHsType GhcRn, FreeVars)
@@ -2297,6 +2369,11 @@ add gp@(HsGroup {hs_tyclds = ts, hs_fixds = fs}) l (TyClD _ d) ds
 -- Signatures: fixity sigs go a different place than all others
 add gp@(HsGroup {hs_fixds = ts}) l (SigD _ (FixSig _ f)) ds
   = addl (gp {hs_fixds = cL l f : ts}) ds
+
+-- Top-level kind-signatures: added to the TyClGroup
+add gp@(HsGroup {hs_tyclds = ts}) l (SigD _ (TLKS _ s)) ds
+  = addl (gp {hs_tyclds = add_tlks (cL l s) ts}) ds
+
 add gp@(HsGroup {hs_valds = ts}) l (SigD _ d) ds
   = addl (gp {hs_valds = add_sig (cL l d) ts}) ds
 
@@ -2337,6 +2414,7 @@ add_tycld :: LTyClDecl (GhcPass p) -> [TyClGroup (GhcPass p)]
           -> [TyClGroup (GhcPass p)]
 add_tycld d []       = [TyClGroup { group_ext    = noExt
                                   , group_tyclds = [d]
+                                  , group_tlkss  = []
                                   , group_roles  = []
                                   , group_instds = []
                                   }
@@ -2349,6 +2427,7 @@ add_instd :: LInstDecl (GhcPass p) -> [TyClGroup (GhcPass p)]
           -> [TyClGroup (GhcPass p)]
 add_instd d []       = [TyClGroup { group_ext    = noExt
                                   , group_tyclds = []
+                                  , group_tlkss  = []
                                   , group_roles  = []
                                   , group_instds = [d]
                                   }
@@ -2361,6 +2440,7 @@ add_role_annot :: LRoleAnnotDecl (GhcPass p) -> [TyClGroup (GhcPass p)]
                -> [TyClGroup (GhcPass p)]
 add_role_annot d [] = [TyClGroup { group_ext    = noExt
                                  , group_tyclds = []
+                                 , group_tlkss  = []
                                  , group_roles  = [d]
                                  , group_instds = []
                                  }
@@ -2368,6 +2448,19 @@ add_role_annot d [] = [TyClGroup { group_ext    = noExt
 add_role_annot d (tycls@(TyClGroup { group_roles = roles }) : rest)
   = tycls { group_roles = d : roles } : rest
 add_role_annot _ (XTyClGroup _: _) = panic "add_role_annot"
+
+add_tlks :: LTopKindSig (GhcPass p) -> [TyClGroup (GhcPass p)]
+         -> [TyClGroup (GhcPass p)]
+add_tlks d [] = [TyClGroup { group_ext    = noExt
+                           , group_tyclds = []
+                           , group_tlkss  = [d]
+                           , group_roles  = []
+                           , group_instds = []
+                           }
+                ]
+add_tlks d (tycls@(TyClGroup { group_tlkss = tlkss }) : rest)
+  = tycls { group_tlkss = d : tlkss } : rest
+add_tlks _ (XTyClGroup _: _) = panic "add_tlks"
 
 add_bind :: LHsBind a -> HsValBinds a -> HsValBinds a
 add_bind b (ValBinds x bs sigs) = ValBinds x (bs `snocBag` b) sigs

@@ -20,7 +20,7 @@ module RnBinds (
    rnLocalBindsAndThen, rnLocalValBindsLHS, rnLocalValBindsRHS,
 
    -- Other bindings
-   rnMethodBinds, renameSigs,
+   rnMethodBinds, renameSigs, renameTLKS,
    rnMatchGroup, rnGRHSs, rnGRHS, rnSrcFixityDecl,
    makeMiniFixityEnv, MiniFixityEnv,
    HsSigCtxt(..)
@@ -62,6 +62,7 @@ import Control.Monad
 import Data.Foldable      ( toList )
 import Data.List          ( partition, sort )
 import Data.List.NonEmpty ( NonEmpty(..) )
+import Data.Void
 
 {-
 -- ToDo: Put the annotations into the monad, so that they arrive in the proper
@@ -832,6 +833,7 @@ a binder.
 
 rnMethodBinds :: Bool                   -- True <=> is a class declaration
               -> Name                   -- Class name
+              -> [Name]                 -- Scoped type variables from the TLKS
               -> [Name]                 -- Type variables from the class/instance header
               -> LHsBinds GhcPs         -- Binds
               -> [LSig GhcPs]           -- and signatures/pragmas
@@ -839,7 +841,7 @@ rnMethodBinds :: Bool                   -- True <=> is a class declaration
 -- Used for
 --   * the default method bindings in a class decl
 --   * the method bindings in an instance decl
-rnMethodBinds is_cls_decl cls ktv_names binds sigs
+rnMethodBinds is_cls_decl cls scoped_tvs ktv_names binds sigs
   = do { checkDupRdrNames (collectMethodBinders binds)
              -- Check that the same method is not given twice in the
              -- same instance decl      instance C T where
@@ -865,7 +867,8 @@ rnMethodBinds is_cls_decl cls ktv_names binds sigs
              sig_ctxt | is_cls_decl = ClsDeclCtxt cls
                       | otherwise   = InstDeclCtxt bound_nms
        ; (spec_inst_prags', sip_fvs) <- renameSigs sig_ctxt spec_inst_prags
-       ; (other_sigs',      sig_fvs) <- extendTyVarEnvFVRn ktv_names $
+       ; (other_sigs',      sig_fvs) <- bindSigTyVarsFV scoped_tvs $
+                                        extendTyVarEnvFVRn ktv_names $
                                         renameSigs sig_ctxt other_sigs
 
        -- Rename the bindings RHSs.  Again there's an issue about whether the
@@ -1043,7 +1046,24 @@ renameSig _ctxt sig@(CompleteMatchSig _ s (L l bf) mty)
       text "A COMPLETE pragma must mention at least one data constructor" $$
       text "or pattern synonym defined in the same module."
 
+renameSig _ TLKS{} = panic "renameSig: TLKS"
 renameSig _ (XSig _) = panic "renameSig"
+
+renameTLKS :: NameSet -> TopKindSig GhcPs -> RnM (TopKindSig GhcRn, FreeVars)
+renameTLKS tc_names sig@(TopKindSig _ v ki)
+  = do  { tlks_ok <- xoptM LangExt.TopLevelKindSignatures
+        ; unless tlks_ok $ addErr tlksErr
+        ; new_v <- lookupSigOccRn (TopSigCtxt tc_names) (TLKS noExt sig) v
+        ; let doc = TopKindSigCtx (ppr v)
+        ; (new_ki, fvs) <- rnHsSigWcType BindUnlessForall doc ki
+        ; return (TopKindSig noExt new_v new_ki, fvs)
+        }
+  where
+    tlksErr :: SDoc
+    tlksErr =
+      hang (text "Illegal top-level kind signature.")
+         2 (text "Use -XTopLevelKindSignatures to enable this extension")
+renameTLKS _ (XTopKindSig x) = absurd x
 
 {-
 Note [Orphan COMPLETE pragmas]
@@ -1111,6 +1131,7 @@ okHsSig ctxt (L _ sig)
      (CompleteMatchSig {}, TopSigCtxt {} ) -> True
      (CompleteMatchSig {}, _)              -> False
 
+     (TLKS{}, _) -> panic "okHsSig: TLKS"
      (XSig _, _) -> panic "okHsSig"
 
 -------------------

@@ -723,6 +723,7 @@ wildCardsAllowed :: RnTyKiEnv -> Bool
 wildCardsAllowed env
    = case rtke_ctxt env of
        TypeSigCtx {}       -> True
+       TopKindSigCtx {}    -> False  -- See Note [Wildcards in TLKS] in TcSigs
        TypBrCtx {}         -> True   -- Template Haskell quoted type
        SpliceTypeCtx {}    -> True   -- Result of a Template Haskell splice
        ExprWithTySigCtx {} -> True
@@ -732,8 +733,6 @@ wildCardsAllowed env
        GHCiCtx {}          -> True
        HsTypeCtx {}        -> True
        _                   -> False
-
-
 
 ---------------
 -- | Ensures either that we're in a type or that -XPolyKinds is set

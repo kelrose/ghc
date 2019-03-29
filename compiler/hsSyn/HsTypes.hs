@@ -92,6 +92,7 @@ import Maybes( isJust )
 import Util ( count )
 
 import Data.Data hiding ( Fixity, Prefix, Infix )
+import Data.Void
 
 {-
 ************************************************************************
@@ -503,7 +504,7 @@ data HsTyVarBndr pass
 
 type instance XUserTyVar    (GhcPass _) = NoExt
 type instance XKindedTyVar  (GhcPass _) = NoExt
-type instance XXTyVarBndr   (GhcPass _) = NoExt
+type instance XXTyVarBndr   (GhcPass _) = Void
 
 -- | Does this 'HsTyVarBndr' come with an explicit kind annotation?
 isHsKindedTyVar :: HsTyVarBndr pass -> Bool
@@ -1396,7 +1397,7 @@ instance (p ~ GhcPass pass, OutputableBndrId p)
        => Outputable (HsTyVarBndr p) where
     ppr (UserTyVar _ n)     = ppr n
     ppr (KindedTyVar _ n k) = parens $ hsep [ppr n, dcolon, ppr k]
-    ppr (XTyVarBndr n)      = ppr n
+    ppr (XTyVarBndr x)      = absurd x
 
 instance (p ~ GhcPass pass,Outputable thing)
        => Outputable (HsImplicitBndrs p thing) where

@@ -364,7 +364,7 @@ renameDeriv is_boot inst_infos bagBinds
                             , ib_derived = sa } })
         =  ASSERT( null sigs )
            bindLocalNamesFV tyvars $
-           do { (rn_binds,_, fvs) <- rnMethodBinds False (is_cls_nm inst) [] binds []
+           do { (rn_binds,_, fvs) <- rnMethodBinds False (is_cls_nm inst) [] [] binds []
               ; let binds' = InstBindings { ib_binds = rn_binds
                                           , ib_tyvars = tyvars
                                           , ib_pragmas = []

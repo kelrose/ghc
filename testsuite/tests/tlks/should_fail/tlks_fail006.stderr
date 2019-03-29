@@ -1,0 +1,2 @@
+
+tlks_fail006.hs:12:20: error: Not in scope: type variable ‘k’
