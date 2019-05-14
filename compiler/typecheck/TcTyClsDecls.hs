@@ -1148,6 +1148,9 @@ kcDeclHeader name flav ki ktvs kc_res_ki =
    -- ; (tv_prs, theta, tau) <- tcInstType tcInstSkolTyVars poly_id
    -- TODO (int-index): See Note [Instantiate sig with fresh variables]
   addTyConFlavCtxt name flav $
+    pushTcLevelM_ $    -- TODO (int-index): is this needed?
+    solveEqualities $  -- TODO (int-index): is this needed?
+    bind_implicit (hsq_ext ktvs) $
     go ki [] (hsq_explicit ktvs)
   where
     go :: Kind                  -- the TLKS kind
@@ -1217,6 +1220,14 @@ kcDeclHeader name flav ki ktvs kc_res_ki =
                   ; discardResult $ unifyKind Nothing d_ki res_ki }
              Nothing -> return ()
          ; return $ mkTcTyCon name tcbs d_ki all_tv_prs True flav }
+
+    bind_implicit :: [Name] -> TcM a -> TcM a
+    bind_implicit tv_names thing_inside =
+      do { let new_tv name = do { kind <- newMetaKindVar
+                                ; tcv <- newPatSigTyVar name kind
+                                ; return (name, tcv) }
+         ; tcvs <- mapM new_tv tv_names
+         ; tcExtendNameTyVarEnv tcvs thing_inside }
 
 tooManyBindersErr :: Kind -> [LHsTyVarBndr GhcRn] -> SDoc
 tooManyBindersErr ki bndrs =
